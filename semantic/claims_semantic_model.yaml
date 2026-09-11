@@ -1,0 +1,213 @@
+# Semantic data model for patient claims analytics.
+#
+# This file follows the Snowflake Cortex Analyst semantic-model spec
+# (https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-analyst) so
+# it can be uploaded to a Snowflake stage and registered with Cortex Analyst
+# as-is. Locally, semantic/model.py parses this same file to drive the
+# natural-language query layer against DuckDB — one semantic layer, two
+# execution engines.
+name: patient_claims_semantic_model
+description: >
+  Semantic model over patient claims, providers, and patients for the
+  ClaimsAI analytics application. Supports natural-language questions about
+  claim volume, spend, denials, and provider/payer billing patterns.
+
+tables:
+  - name: claims
+    description: One row per claim line (or per claim, for this prototype).
+    base_table:
+      database: HEALTHCARE_DB
+      schema: CLAIMS
+      table: CLAIMS
+    primary_key:
+      columns: [CLAIM_ID]
+    dimensions:
+      - name: claim_id
+        expr: CLAIM_ID
+        data_type: VARCHAR
+        description: Unique claim identifier.
+        unique: true
+      - name: patient_id
+        expr: PATIENT_ID
+        data_type: VARCHAR
+        description: Foreign key to the patient who received the service.
+      - name: provider_id
+        expr: PROVIDER_ID
+        data_type: VARCHAR
+        description: Foreign key to the billing provider.
+      - name: payer
+        expr: PAYER
+        data_type: VARCHAR
+        description: Insurance payer for the claim.
+        synonyms: [insurer, insurance company, health plan]
+      - name: diagnosis_code
+        expr: DIAGNOSIS_CODE
+        data_type: VARCHAR
+        description: ICD-10 diagnosis code.
+        synonyms: [icd10, icd-10, diagnosis]
+      - name: diagnosis_desc
+        expr: DIAGNOSIS_DESC
+        data_type: VARCHAR
+        description: Human-readable diagnosis description.
+      - name: procedure_code
+        expr: PROCEDURE_CODE
+        data_type: VARCHAR
+        description: CPT/HCPCS procedure code.
+        synonyms: [cpt, cpt code, procedure]
+      - name: procedure_desc
+        expr: PROCEDURE_DESC
+        data_type: VARCHAR
+        description: Human-readable procedure description.
+      - name: place_of_service
+        expr: PLACE_OF_SERVICE
+        data_type: VARCHAR
+        description: Site of service category (office, emergency, surgical, etc).
+      - name: claim_status
+        expr: CLAIM_STATUS
+        data_type: VARCHAR
+        description: Adjudication status of the claim.
+        synonyms: [status]
+    time_dimensions:
+      - name: service_date
+        expr: SERVICE_DATE
+        data_type: DATE
+        description: Date the service was rendered.
+      - name: submission_date
+        expr: SUBMISSION_DATE
+        data_type: DATE
+        description: Date the claim was submitted for adjudication.
+    measures:
+      - name: claim_count
+        expr: CLAIM_ID
+        data_type: NUMBER
+        default_aggregation: count
+        description: Number of claims.
+        synonyms: [number of claims, claim volume, volume]
+      - name: billed_amount
+        expr: BILLED_AMOUNT
+        data_type: NUMBER
+        default_aggregation: sum
+        description: Total amount billed by the provider.
+        synonyms: [charges, billed, spend, billed spend]
+      - name: paid_amount
+        expr: PAID_AMOUNT
+        data_type: NUMBER
+        default_aggregation: sum
+        description: Total amount paid by the payer.
+        synonyms: [paid, reimbursement, allowed amount]
+      - name: avg_billed_amount
+        expr: BILLED_AMOUNT
+        data_type: NUMBER
+        default_aggregation: avg
+        description: Average billed amount per claim.
+        synonyms: [average charge, average bill, average billed amount, avg billed amount, mean billed amount]
+
+  - name: providers
+    description: One row per billing provider.
+    base_table:
+      database: HEALTHCARE_DB
+      schema: CLAIMS
+      table: PROVIDERS
+    primary_key:
+      columns: [PROVIDER_ID]
+    dimensions:
+      - name: provider_id
+        expr: PROVIDER_ID
+        data_type: VARCHAR
+        unique: true
+      - name: provider_name
+        expr: PROVIDER_NAME
+        data_type: VARCHAR
+        synonyms: [provider, clinic, billing entity]
+      - name: npi
+        expr: NPI
+        data_type: VARCHAR
+        description: National Provider Identifier.
+      - name: specialty
+        expr: SPECIALTY
+        data_type: VARCHAR
+      - name: state
+        expr: STATE
+        data_type: VARCHAR
+        synonyms: [provider state]
+
+  - name: patients
+    description: One row per patient (demographics only, no PHI in this synthetic set).
+    base_table:
+      database: HEALTHCARE_DB
+      schema: CLAIMS
+      table: PATIENTS
+    primary_key:
+      columns: [PATIENT_ID]
+    dimensions:
+      - name: patient_id
+        expr: PATIENT_ID
+        data_type: VARCHAR
+        unique: true
+      - name: gender
+        expr: GENDER
+        data_type: VARCHAR
+      - name: state
+        expr: STATE
+        data_type: VARCHAR
+        synonyms: [patient state]
+    measures:
+      - name: patient_age
+        expr: AGE
+        data_type: NUMBER
+        default_aggregation: avg
+        synonyms: [age]
+
+relationships:
+  - name: claims_to_providers
+    left_table: claims
+    right_table: providers
+    relationship_columns:
+      - left_column: provider_id
+        right_column: provider_id
+    join_type: left_outer
+    relationship_type: many_to_one
+  - name: claims_to_patients
+    left_table: claims
+    right_table: patients
+    relationship_columns:
+      - left_column: patient_id
+        right_column: patient_id
+    join_type: left_outer
+    relationship_type: many_to_one
+
+# Verified queries "teach" Cortex Analyst (and our local NLQ fallback) the
+# right SQL shape for common questions -- improves accuracy on similar
+# future questions.
+verified_queries:
+  - name: total billed amount by payer
+    question: What is the total billed amount by payer?
+    sql: |
+      SELECT c.PAYER, SUM(c.BILLED_AMOUNT) AS TOTAL_BILLED
+      FROM claims c
+      GROUP BY c.PAYER
+      ORDER BY TOTAL_BILLED DESC
+  - name: claim volume by month
+    question: How many claims were there per month?
+    sql: |
+      SELECT DATE_TRUNC('month', c.SERVICE_DATE) AS MONTH, COUNT(*) AS CLAIM_COUNT
+      FROM claims c
+      GROUP BY 1
+      ORDER BY 1
+  - name: top providers by billed amount
+    question: Which providers bill the most?
+    sql: |
+      SELECT p.PROVIDER_NAME, SUM(c.BILLED_AMOUNT) AS TOTAL_BILLED
+      FROM claims c
+      JOIN providers p ON c.PROVIDER_ID = p.PROVIDER_ID
+      GROUP BY p.PROVIDER_NAME
+      ORDER BY TOTAL_BILLED DESC
+      LIMIT 20
+  - name: denial rate by payer
+    question: What is the denial rate by payer?
+    sql: |
+      SELECT PAYER,
+             SUM(CASE WHEN CLAIM_STATUS = 'Denied' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS DENIAL_RATE
+      FROM claims
+      GROUP BY PAYER
+      ORDER BY DENIAL_RATE DESC
