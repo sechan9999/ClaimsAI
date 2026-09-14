@@ -52,6 +52,11 @@ class NLQResult:
     sql: str
     explanation: str
     matched_via: str  # "verified_query" | "slot_filling" | "unresolved"
+    params: list = None  # values bound to `?` placeholders in `sql`, if any
+
+    def __post_init__(self):
+        if self.params is None:
+            self.params = []
 
 
 def _best_verified_match(question: str, model: SemanticModel, threshold: float = 0.5):
@@ -106,26 +111,50 @@ def _find_measure(question: str, model: SemanticModel):
 
 def _find_group_by(question: str, model: SemanticModel):
     q = question.lower()
+    # Longest matching name/synonym wins, same rule as _find_measure -- e.g.
+    # "providers" and "patients" both have a STATE dimension disambiguated
+    # via the synonyms "provider state" / "patient state" in the semantic
+    # model. Taking the first match (as this used to) meant a question like
+    # "billed amount by provider state" could silently resolve to whichever
+    # table's STATE field happened to iterate first, ignoring the qualifier.
+    # Longest-match lets "provider state" beat the bare "state" on the other
+    # table. A genuinely unqualified "by state" is still an honest tie,
+    # broken by iteration order -- that ambiguity is inherent to the input,
+    # not a matching bug.
+    best_table, best_dim, best_len = None, None, 0
     for table_name, d in model.all_dimensions():
-        candidates = [d.name.lower()] + [s.lower() for s in d.synonyms]
-        if any(c in q for c in candidates):
-            return table_name, d
-    return None, None
+        candidates = [d.name.lower().replace("_", " ")] + [s.lower() for s in d.synonyms]
+        for c in candidates:
+            if c in q and len(c) > best_len:
+                best_table, best_dim, best_len = table_name, d, len(c)
+    return best_table, best_dim
 
 
-def _find_filters(question: str):
-    filters = []
+def _find_filters(question: str) -> tuple[list[str], list]:
+    """
+    Returns (sql_fragments, params). Each fragment uses a `?` placeholder
+    bound to the matching value in `params`, rather than the value being
+    formatted into the fragment string. The values matched here only ever
+    come from a fixed vocabulary (_KNOWN_PAYERS/_KNOWN_STATUSES) or a
+    regex-extracted year, but binding them as params anyway means extending
+    that vocabulary later can never reopen a SQL-injection surface.
+    """
+    fragments: list[str] = []
+    params: list = []
+    q_lower = question.lower()
     for payer in _KNOWN_PAYERS:
-        if payer.lower() in question.lower():
-            filters.append(f"c.PAYER = '{payer}'")
+        if payer.lower() in q_lower:
+            fragments.append("c.PAYER = ?")
+            params.append(payer)
     for status in _KNOWN_STATUSES:
-        if re.search(rf"\b{status.lower()}\b", question.lower()):
-            filters.append(f"c.CLAIM_STATUS = '{status}'")
+        if re.search(rf"\b{status.lower()}\b", q_lower):
+            fragments.append("c.CLAIM_STATUS = ?")
+            params.append(status)
     year_match = re.search(r"\b(20\d{2})\b", question)
     if year_match:
-        year = year_match.group(1)
-        filters.append(f"EXTRACT(year FROM c.SERVICE_DATE) = {year}")
-    return filters
+        fragments.append("EXTRACT(year FROM c.SERVICE_DATE) = ?")
+        params.append(int(year_match.group(1)))
+    return fragments, params
 
 
 def _needs_table(table_name: str, group_table: str | None) -> bool:
@@ -133,7 +162,7 @@ def _needs_table(table_name: str, group_table: str | None) -> bool:
 
 
 def to_sql(question: str, model: SemanticModel) -> NLQResult:
-    filters = _find_filters(question)
+    filters, filter_params = _find_filters(question)
 
     # 1. Verified-query shortcut -- only when the question carries no filter
     # cues (a specific payer, year, or status). Verified-query SQL is a fixed
@@ -212,4 +241,4 @@ def to_sql(question: str, model: SemanticModel) -> NLQResult:
         explanation_bits.append(f"filtered on {', '.join(filters)}")
     explanation = "Built from the semantic model: " + "; ".join(explanation_bits) + "."
 
-    return NLQResult(sql=sql, explanation=explanation, matched_via="slot_filling")
+    return NLQResult(sql=sql, explanation=explanation, matched_via="slot_filling", params=filter_params)

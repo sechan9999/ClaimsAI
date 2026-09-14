@@ -41,8 +41,11 @@ def _provider():
 
 
 @st.cache_data
-def _run_query(sql: str) -> pd.DataFrame:
-    return run_query(sql)
+def _run_query(sql: str, params: tuple = ()) -> pd.DataFrame:
+    # params is a tuple (not a list) so st.cache_data can hash it as part of
+    # the cache key -- see nlq/text_to_sql.py / warehouse/connection.py for
+    # why values are bound here rather than formatted into `sql`.
+    return run_query(sql, params=params)
 
 
 @st.cache_data
@@ -81,7 +84,7 @@ with tab_ask:
                 st.code(result.sql, language="sql")
                 st.caption(result.explanation)
             try:
-                df = _run_query(result.sql)
+                df = _run_query(result.sql, tuple(result.params))
             except Exception as e:
                 st.error(f"Query failed: {e}")
                 df = pd.DataFrame()

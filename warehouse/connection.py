@@ -23,10 +23,21 @@ Replace get_connection()/run_query() with:
 Or, when running as Streamlit-in-Snowflake, use `st.connection("snowflake")`
 / `get_active_session()` (Snowpark) instead of a connector object -- the
 `run_query` signature below stays identical either way.
+
+--- Parameters ---
+Never build SQL by f-string-ing user-controlled values into the query text.
+`run_query(sql, params)` passes `params` straight to the underlying driver's
+own parameterization, so untrusted input (a claim ID typed into a text box,
+a payer name matched out of a free-text question, etc.) is always bound as
+data, never spliced into the SQL string. DuckDB and snowflake-connector-python
+both accept `?` positional placeholders, so callers write the same SQL either
+way; only the driver underneath changes.
 """
 from __future__ import annotations
 
 import os
+from typing import Any, Sequence
+
 import duckdb
 import pandas as pd
 
@@ -57,9 +68,17 @@ def get_connection() -> duckdb.DuckDBPyConnection:
     return _conn
 
 
-def run_query(sql: str) -> pd.DataFrame:
-    """Execute SQL against the warehouse and return a pandas DataFrame."""
+def run_query(sql: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
+    """
+    Execute SQL against the warehouse and return a pandas DataFrame.
+
+    Pass untrusted values (claim IDs, matched filter values, etc.) via
+    `params` with `?` placeholders in `sql` -- never by formatting them into
+    the SQL string. e.g. run_query("SELECT * FROM claims WHERE CLAIM_ID = ?", [claim_id])
+    """
     conn = get_connection()
+    if params:
+        return conn.execute(sql, list(params)).fetchdf()
     return conn.execute(sql).fetchdf()
 
 

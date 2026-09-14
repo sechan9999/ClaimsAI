@@ -105,11 +105,12 @@ def claim_detail(claim_id: str) -> dict:
     row = row.iloc[0].to_dict()
 
     raw_claim = run_query(
-        f"""
+        """
         SELECT c.*, p.PROVIDER_NAME, p.SPECIALTY
         FROM claims c
         JOIN providers p ON c.PROVIDER_ID = p.PROVIDER_ID
-        WHERE c.CLAIM_ID = '{claim_id}'
-        """
+        WHERE c.CLAIM_ID = ?
+        """,
+        params=[claim_id],
     )
     return {"features": row, "claim": raw_claim.iloc[0].to_dict() if not raw_claim.empty else {}}
