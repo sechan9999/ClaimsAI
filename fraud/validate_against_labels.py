@@ -11,8 +11,10 @@ at a few top-N cutoffs a fraud analyst might realistically review.
 import os
 import pandas as pd
 from fraud.detection import score_claims
+from fraud.benford import provider_benford_scores, FLAG_P_VALUE
 
 LABELS_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "generated", "claims_fraud_labels.parquet")
+CLAIMS_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "generated", "claims.parquet")
 
 
 def main():
@@ -39,6 +41,30 @@ def main():
     )
     for fraud_type, (caught, total) in by_type.items():
         print(f"  {fraud_type:<20} {caught:>5}/{total:<5} ({caught/total:.1%})")
+
+    print("\n--- Provider-level Benford's Law check (group signal, separate from the per-claim model above) ---")
+    claims = pd.read_parquet(CLAIMS_PATH)
+    fraud_claims = claims.merge(labels[labels["IS_FRAUD"]], on="CLAIM_ID")
+    actual_fraud_providers = set(fraud_claims["PROVIDER_ID"].unique())
+
+    benford = provider_benford_scores()
+    flagged_providers = set(benford[benford["BENFORD_FLAG"]]["PROVIDER_ID"])
+    true_positives = flagged_providers & actual_fraud_providers
+
+    precision = len(true_positives) / len(flagged_providers) if flagged_providers else 0.0
+    recall = len(true_positives) / len(actual_fraud_providers) if actual_fraud_providers else 0.0
+    print(f"Providers tested: {len(benford):,} | providers carrying >=1 injected-fraud claim: "
+          f"{len(actual_fraud_providers):,}")
+    print(f"Benford-flagged providers (p<{FLAG_P_VALUE}): {len(flagged_providers):,} | "
+          f"of which actually fraud-carrying: {len(true_positives):,}")
+    print(f"Provider-level precision={precision:.1%}  recall={recall:.1%}")
+    print(
+        "This is a *group* signal over a whole provider's billing pattern, not a per-claim one -- "
+        "expect it to catch providers whose fraud is spread across many claims (e.g. systematic "
+        "upcoding/outlier amounts) rather than a single anomalous claim from an otherwise normal "
+        "provider, and expect some false positives from providers whose legitimate billing happens "
+        "to cluster (e.g. a narrow-specialty practice with few distinct price points)."
+    )
 
 
 if __name__ == "__main__":

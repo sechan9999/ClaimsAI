@@ -21,6 +21,7 @@ from semantic.model import load_semantic_model
 from nlq.text_to_sql import to_sql
 from warehouse.connection import run_query
 from fraud.detection import score_claims, claim_detail
+from fraud.benford import provider_benford_scores
 from reporting.summarize import summarize_result, executive_report
 from llm.provider import get_provider
 
@@ -51,6 +52,11 @@ def _run_query(sql: str, params: tuple = ()) -> pd.DataFrame:
 @st.cache_data
 def _scored_claims() -> pd.DataFrame:
     return score_claims()
+
+
+@st.cache_data
+def _benford_scores() -> pd.DataFrame:
+    return provider_benford_scores()
 
 
 semantic_model = _model()
@@ -133,6 +139,24 @@ with tab_fraud:
         use_container_width=True,
         hide_index=True,
     )
+
+    st.markdown("#### Provider billing digit-pattern (Benford's Law)")
+    st.caption(
+        "Group-level signal, independent of the per-claim model above: tests whether each "
+        "provider's billed-amount leading digits follow Benford's Law (chi-square goodness-of-fit). "
+        "A significant deviation means the provider's amounts, as a group, look statistically "
+        "manufactured rather than naturally varied — worth a review queue of its own, even when "
+        "no single claim from that provider ranks as a per-claim outlier above."
+    )
+    benford = _benford_scores()
+    n_flagged = int(benford["BENFORD_FLAG"].sum()) if not benford.empty else 0
+    st.metric("Providers flagged (p < 0.01)", n_flagged, help=f"Out of {len(benford)} providers with enough claims to test")
+    if n_flagged:
+        st.dataframe(
+            benford[benford["BENFORD_FLAG"]][["PROVIDER_ID", "N_CLAIMS", "CHI2_STATISTIC", "P_VALUE"]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
     st.markdown("#### Investigate a claim")
     pick = st.text_input("Claim ID", placeholder="e.g. CL0000123")

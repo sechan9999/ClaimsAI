@@ -20,7 +20,8 @@
   - [1. Semantic Layer & Cortex-Compatible Model](#1-semantic-layer--cortex-compatible-model)
   - [2. Natural Language Query (NLQ) & Parameterized SQL](#2-natural-language-query-nlq--parameterized-sql)
   - [3. In-Warehouse Feature Engineering & Fraud Scoring](#3-in-warehouse-feature-engineering--fraud-scoring)
-  - [4. Narrative Reporting & Pluggable LLMs](#4-narrative-reporting--pluggable-llms)
+  - [4. Provider-Level Statistical Fraud Signal: Benford's Law](#4-provider-level-statistical-fraud-signal-benfords-law)
+  - [5. Narrative Reporting & Pluggable LLMs](#5-narrative-reporting--pluggable-llms)
 - [Deploying to Snowflake](#-deploying-to-snowflake)
 - [Validation & Benchmarks](#-validation--benchmarks)
 - [Design Considerations & Roadmap](#-design-considerations--roadmap)
@@ -33,6 +34,7 @@
 | :--- | :--- |
 | 💬 **Ask (Semantic NLQ)** | Ask plain-English questions (*"What is the total billed amount by payer?"* or *"Show me denied claims in 2024"*). Grounded directly in the Cortex Analyst semantic model using longest-match disambiguation and safe parameterized execution. Automatically renders interactive Plotly charts and narrative insights. |
 | 🚩 **Fraud & Abuse Detection** | Unsupervised `IsolationForest` scoring combined with in-warehouse feature engineering (`sql/002_claim_features.sql`). Analyzes peer-group z-score anomalies, duplicate same-day filings, 30-day visit velocity, and submission lag. Assigns a calibrated 0–100 risk score, risk tier (`High`, `Medium`, `Low`), and plain-English root-cause explanations. |
+| 🔢 **Provider Digit-Pattern Analysis (Benford's Law)** | Group-level statistical companion to the per-claim model: chi-square test of each provider's billed-amount leading-digit distribution against Benford's Law, flagging providers whose billing pattern looks statistically manufactured even when no individual claim ranks as an outlier. Kept as a separate signal rather than blended into the per-claim score — see [Validation & Benchmarks](#-validation--benchmarks) for why. |
 | 📊 **Executive Reporting** | Portfolio-level financial health dashboard tracking Claim Volume, Billed Spend, Reimbursed Amount, Denial Rates, and Fraud Exposure. Features monthly trend trajectory graphs and automated narrative briefings. |
 | 🔎 **Data Explorer** | Direct warehouse table browser with row sampling and column sorting across raw `claims`, `patients`, and `providers` tables. |
 | 🧭 **Semantic Model Inspector** | Complete transparency view into entities, dimensions, calculated measures, synonyms, and verified golden queries configured in the semantic layer. |
@@ -96,7 +98,8 @@ claimsai/
 │   └── text_to_sql.py              # Semantic-grounded NLQ with longest-match & param binding
 ├── fraud/
 │   ├── detection.py                # IsolationForest scoring, risk calibration & explanations
-│   └── validate_against_labels.py  # Precision/recall benchmarking script
+│   ├── benford.py                  # Provider-level Benford's Law chi-square fraud signal
+│   └── validate_against_labels.py  # Precision/recall benchmarking script (per-claim + provider-level)
 ├── reporting/
 │   └── summarize.py                # Narrative summarization (Cortex Complete or heuristic fallback)
 └── llm/
@@ -178,7 +181,17 @@ The semantic model in `semantic/claims_semantic_model.yaml` implements the offic
 
 In `fraud/detection.py`, an unsupervised **IsolationForest** consumes these vectors and converts decision boundaries into a calibrated 0–100 **Risk Score**, categorizing claims into `High`, `Medium`, or `Low` tiers alongside plain-language triage explanations.
 
-### 4. Narrative Reporting & Pluggable LLMs
+### 4. Provider-Level Statistical Fraud Signal: Benford's Law
+
+`fraud/benford.py` adds a second, independent fraud lens — the same Benford's Law + chi-square technique used for grant-fraud monitoring in a companion project (NEMESIS), applied here to provider billing:
+
+- For each provider with enough claims to test, extracts the **leading (first significant) digit** of every `BILLED_AMOUNT`.
+- Runs a **chi-square goodness-of-fit test** against Benford's Law's expected distribution ($P(d) = \log_{10}(1 + 1/d)$ for $d \in \{1..9\}$) — the pattern naturally-occurring financial figures follow, and typed, rounded, or fabricated amounts tend to depart from.
+- Flags providers at $p < 0.01$ (deliberately stricter than the conventional 0.05, since testing every provider at once means some will cross 0.05 by chance alone).
+
+This is a **group-level** signal — it says something about a provider's billing pattern as a whole, not about any single claim — so it's surfaced as its own view (a flagged-provider table in the Fraud Detection tab, and a note in a claim's `EXPLANATION` when it belongs to a flagged provider), rather than mixed into the per-claim `RISK_SCORE`. See [Validation & Benchmarks](#-validation--benchmarks) for the measured reason why.
+
+### 5. Narrative Reporting & Pluggable LLMs
 
 `reporting/summarize.py` and `llm/provider.py` deliver fluent analytical commentary:
 - **Local Mode**: Uses robust template heuristics to generate clear, immediate executive summaries of query results and portfolio trends.
@@ -239,13 +252,26 @@ To validate the unsupervised fraud detection engine against synthetic ground-tru
 python -m fraud.validate_against_labels
 ```
 
-### Benchmark Results (Synthetic Evaluation Dataset):
-- **Top 3,000 Scored Claims**: **~99% Precision** / **~92% Recall**
-- **High-Detection Patterns**:
-  - Outlier billed amounts (peer z-score $\ge 3$)
-  - Duplicate same-day billing
-  - Abnormal 30-day visit velocity
-- **Subtler Patterns (e.g. ~2x Unbundling)**: Detected at ~28% recall; can be further strengthened with provider-level billing mixture features prior to production deployment.
+### Per-Claim IsolationForest (Synthetic Evaluation Dataset)
+- **Top 3,000 Scored Claims**: **~99% Precision** / **~91% Recall**
+- **High-Detection Patterns**: outlier billed amounts (peer z-score ≥ 3), duplicate same-day billing, abnormal 30-day visit velocity, upcoding.
+- **Subtler Pattern (~2x Unbundling)**: ~34% recall — the weakest spot; a provider-level billing-mix feature (e.g. co-billed CPT-code pairs vs. peer norms) would likely help more than the current amount-only features.
+
+### Provider-Level Benford's Law (Synthetic Evaluation Dataset)
+- **Provider-Level Precision / Recall**: **~31% / ~67%** — catches 4 of the 6 providers seeded as fraud sources, at the cost of ~9 false-positive flags out of 13 total.
+- **Why it's not blended into `RISK_SCORE`**: an earlier version floored every claim from a flagged provider at a minimum risk score. That measurably *hurt* per-claim triage — a flagged provider can carry hundreds of otherwise-ordinary claims, and forcing them all above the Medium threshold pushed genuinely higher-risk claims out of the reviewable top-N (dropped the per-claim benchmark from ~99%/91% to ~82%/76% at Top 3,000 in testing). Benford's Law answers a different question — *"does this provider's overall billing pattern look manufactured?"* — so it's kept as its own signal (a provider table in the UI, a note in `EXPLANATION`) rather than collapsed into a ranking it isn't actually measuring. Re-run the check yourself: `python -m fraud.validate_against_labels`.
+- **Read the numbers for what they are, not more**: on 120 providers with only 6 true fraud sources, the ground-truth base rate is small enough that these percentages will swing a lot between synthetic-data seeds — the qualitative finding (catches multi-claim systematic patterns; produces some false positives; complements rather than replaces the per-claim model) is the durable takeaway, not the exact 31%/67%.
+
+---
+
+## 🗺️ Design Considerations & Roadmap
+
+Known gaps, called out explicitly rather than glossed over:
+- **No model persistence/versioning**: `IsolationForest` refits fresh on every call (deterministic via `random_state=42`, but no saved artifact, drift tracking, or feedback loop from analyst dispositions).
+- **No CI/tests wired up yet** — a `pytest` suite plus a GitHub Actions workflow is the next-highest-value addition before treating this as more than a prototype.
+- **Rare-procedure peer groups**: `AMOUNT_Z_IN_PEER_GROUP` nulls out for procedure codes with too few claims to compute a peer standard deviation, silently disabling that signal exactly where it's least reliable anyway.
+- **Local NLQ matcher is intentionally simple** — Cortex Analyst is the intended production replacement, not a target to keep improving locally.
+- **No auth layer** — fine for a public synthetic-data demo; not something to point at real claims/PHI without one.
 
 ---
 

@@ -25,6 +25,7 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest
 
 from warehouse.connection import run_sql_file, run_query
+from fraud.benford import provider_benford_scores
 
 _FEATURES_SQL = os.path.join(os.path.dirname(__file__), "..", "sql", "002_claim_features.sql")
 
@@ -44,6 +45,14 @@ def _load_features() -> pd.DataFrame:
 
 def _explain(row: pd.Series) -> list[str]:
     reasons = []
+    if row.get("BENFORD_FLAG"):
+        reasons.append(
+            f"This claim's provider ({row['PROVIDER_ID']}) bills amounts whose leading-digit "
+            f"pattern deviates significantly from Benford's Law (chi²={row['BENFORD_CHI2']:.1f}, "
+            f"p={row['BENFORD_P_VALUE']:.4f} across {int(row['BENFORD_N_CLAIMS'])} claims) -- a "
+            f"signal of statistically manufactured rather than naturally varied billing, independent "
+            f"of any single claim's amount."
+        )
     z = row["AMOUNT_Z_IN_PEER_GROUP"]
     if z >= 3:
         reasons.append(
@@ -68,12 +77,34 @@ def _explain(row: pd.Series) -> list[str]:
     return reasons
 
 
+def _attach_benford(features: pd.DataFrame) -> pd.DataFrame:
+    """
+    Join provider-level Benford's Law results onto per-claim rows. This is
+    a group-level signal (see fraud/benford.py) -- every claim from a
+    flagged provider carries the same BENFORD_* values, distinct from the
+    per-claim IsolationForest features which vary claim to claim.
+    Providers with too few claims to test (see MIN_CLAIMS_FOR_TEST) simply
+    get no Benford columns and are never flagged on this signal.
+    """
+    benford = provider_benford_scores().rename(
+        columns={
+            "CHI2_STATISTIC": "BENFORD_CHI2",
+            "P_VALUE": "BENFORD_P_VALUE",
+            "N_CLAIMS": "BENFORD_N_CLAIMS",
+        }
+    )
+    merged = features.merge(benford, on="PROVIDER_ID", how="left")
+    merged["BENFORD_FLAG"] = merged["BENFORD_FLAG"].fillna(False)
+    return merged
+
+
 def score_claims(top_n: int | None = None) -> pd.DataFrame:
     """
     Returns claims ranked by risk score (0-100, higher = more anomalous),
     with a RISK_TIER and human-readable EXPLANATION for each.
     """
     features = _load_features()
+    features = _attach_benford(features)
     X = features[_MODEL_FEATURES].to_numpy()
 
     model = IsolationForest(
@@ -85,6 +116,18 @@ def score_claims(top_n: int | None = None) -> pd.DataFrame:
     risk_score = 100 * (raw - raw.min()) / (raw.max() - raw.min() + 1e-9)
 
     features["RISK_SCORE"] = risk_score.round(1)
+
+    # Deliberately NOT blended into RISK_SCORE. An earlier version floored
+    # every claim from a Benford-flagged provider at a minimum score, but
+    # validation (fraud/validate_against_labels.py) showed this measurably
+    # hurt the per-claim triage ranking: a flagged provider can carry
+    # hundreds of otherwise-ordinary claims, and forcing all of them above
+    # the Medium threshold pushed genuinely higher-risk claims out of the
+    # top-N a triage queue would actually work through. Benford's Law is a
+    # provider-level statement ("this billing pattern looks manufactured"),
+    # not a claim-level one, so it's surfaced as its own signal -- in
+    # EXPLANATION text here, and as a standalone provider table in the UI --
+    # rather than collapsed into the same per-claim ranking.
     features["RISK_TIER"] = pd.cut(
         features["RISK_SCORE"], bins=[-1, 50, 80, 101], labels=["Low", "Medium", "High"]
     )
